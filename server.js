@@ -80,7 +80,7 @@ function refundCredit() {
 const activeTokens = new Map();
 const TOKEN_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
 
-s// 👉 The shop owner's WhatsApp number (with country code, no "+" or spaces),
+// 👉 The shop owner's WhatsApp number (with country code, no "+" or spaces),
 //    e.g. 919876543210 for an Indian number. Set WHATSAPP_NUMBER in your .env.
 const WHATSAPP_NUMBER = process.env.WHATSAPP_NUMBER || '910000000000';
 
