@@ -53,7 +53,7 @@ function requireAuth(req, res, next) {
 app.use(cors({
   origin: [
     // 👉 Replace with your actual deployed frontend URL (e.g. Vercel/Netlify link)
-    'https://spm-creation-frontend.vercel.app',
+    'qr-lock-spm-c-front.vercel.app',
     'http://localhost:3000',
     'http://127.0.0.1:5500'
   ],
