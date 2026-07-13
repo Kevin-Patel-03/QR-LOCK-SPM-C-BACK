@@ -21,10 +21,68 @@ if (QR_PASSWORD === 'CHANGE-ME-SET-QR_PASSWORD-IN-ENV') {
   console.warn('⚠️  QR_PASSWORD is not set in .env — using an insecure default. Set it before going live!');
 }
 
+// -----------------------------
+// 💳 GLOBAL credit pool
+// -----------------------------
+// Credits are shared across EVERY customer / QR scan / session — it's one
+// pool for the whole app, not per-person. This is what you sell to a client
+// (e.g. "4000 review credits"), and it counts down no matter who is using it
+// or how many different phones/QR scans are involved.
+//
+// 👉 CREDIT_LIMIT only sets the STARTING size of the pool the very first time
+//    the server runs (when credits.json doesn't exist yet). After that, the
+//    pool total lives in credits.json and CREDIT_LIMIT is ignored — use the
+//    /api/admin/add-credits endpoint below to top it up.
+const fs = require('fs');
+const path = require('path');
+const CREDIT_LIMIT = parseInt(process.env.CREDIT_LIMIT, 10) || 5;
+const CREDITS_FILE = path.join(__dirname, 'credits.json');
+
+// 👉 Set this in your .env to a long random string. Required to top up credits.
+const ADMIN_KEY = process.env.ADMIN_KEY || 'CHANGE-ME-SET-ADMIN_KEY-IN-ENV';
+
+function loadCreditPool() {
+  try {
+    const raw = fs.readFileSync(CREDITS_FILE, 'utf8');
+    const data = JSON.parse(raw);
+    if (typeof data.remaining === 'number') return data;
+  } catch (e) { /* file doesn't exist yet — fall through to default */ }
+  const initial = { remaining: CREDIT_LIMIT, totalIssued: CREDIT_LIMIT };
+  saveCreditPool(initial);
+  return initial;
+}
+
+function saveCreditPool(pool) {
+  fs.writeFileSync(CREDITS_FILE, JSON.stringify(pool, null, 2));
+}
+
+let creditPool = loadCreditPool();
+console.log(`💳 Credit pool loaded: ${creditPool.remaining} remaining of ${creditPool.totalIssued}`);
+
+// Reserve one credit up front (before the paid Anthropic call), so two
+// requests arriving at the same instant can't both slip through on the
+// last credit. If the generation later fails, the credit is refunded.
+function reserveCredit() {
+  if (creditPool.remaining <= 0) return false;
+  creditPool.remaining -= 1;
+  saveCreditPool(creditPool);
+  return true;
+}
+
+function refundCredit() {
+  creditPool.remaining += 1;
+  saveCreditPool(creditPool);
+}
+
+// (Credits are NOT stored here anymore — see the global credit pool above.)
 // In-memory store of valid session tokens issued after a successful scan.
 // token -> expiry timestamp (ms). Cleared automatically when the server restarts.
 const activeTokens = new Map();
 const TOKEN_TTL_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+s// 👉 The shop owner's WhatsApp number (with country code, no "+" or spaces),
+//    e.g. 919876543210 for an Indian number. Set WHATSAPP_NUMBER in your .env.
+const WHATSAPP_NUMBER = process.env.WHATSAPP_NUMBER || '910000000000';
 
 function issueToken() {
   const token = crypto.randomBytes(24).toString('hex');
@@ -143,7 +201,38 @@ app.post('/api/verify-qr', (req, res) => {
 app.get('/api/business', requireAuth, (req, res) => {
   // Don't leak the raw review link/instagram URL if you'd rather keep it server-side only.
   // Currently sent as-is so the frontend can build the publish buttons.
-  res.json(DATABASE.business);
+  res.json({
+    ...DATABASE.business,
+    ownerWhatsapp: WHATSAPP_NUMBER,
+    creditLimit: creditPool.totalIssued,
+    remainingCredits: creditPool.remaining
+  });
+});
+
+// 👉 The frontend polls this to refresh the credit badge in real time,
+// since the pool is shared across every customer using the app right now.
+app.get('/api/credits', requireAuth, (req, res) => {
+  res.json({ remainingCredits: creditPool.remaining, creditLimit: creditPool.totalIssued });
+});
+
+// 👉 Use this to top up the shared pool after a client buys more credits
+// (e.g. "add 4000 credits"). Protect it with ADMIN_KEY — never expose this
+// endpoint or key to customers.
+//    curl -X POST https://your-server/api/admin/add-credits \
+//      -H "Content-Type: application/json" -H "x-admin-key: YOUR_ADMIN_KEY" \
+//      -d '{"amount": 4000}'
+app.post('/api/admin/add-credits', (req, res) => {
+  if (req.headers['x-admin-key'] !== ADMIN_KEY || ADMIN_KEY === 'CHANGE-ME-SET-ADMIN_KEY-IN-ENV') {
+    return res.status(401).json({ error: 'Unauthorized. Set ADMIN_KEY in your .env first.' });
+  }
+  const amount = parseInt(req.body?.amount, 10);
+  if (!amount || amount <= 0) {
+    return res.status(400).json({ error: 'Provide a positive integer "amount" of credits to add.' });
+  }
+  creditPool.remaining += amount;
+  creditPool.totalIssued += amount;
+  saveCreditPool(creditPool);
+  res.json({ success: true, remainingCredits: creditPool.remaining, totalIssued: creditPool.totalIssued });
 });
 
 app.post('/api/generate', requireAuth, async (req, res) => {
@@ -151,6 +240,17 @@ app.post('/api/generate', requireAuth, async (req, res) => {
 
   if (!selectedProducts || selectedProducts.length === 0) {
     return res.status(400).json({ error: 'No products selected' });
+  }
+
+  // 🔒 Global credit check — this pool is shared by every customer using
+  // the app, not per-person. Reserve a credit now; refund it below if the
+  // generation call fails.
+  if (!reserveCredit()) {
+    return res.status(403).json({
+      error: 'NO_CREDITS',
+      message: 'All review credits for this app have been used up.',
+      remainingCredits: 0
+    });
   }
 
   const biz = DATABASE.business;
@@ -199,10 +299,11 @@ Write a 2-3 sentence positive review based on these selected items.`
     });
 
     const review = message.content.find(b => b.type === 'text')?.text?.trim() || '';
-    res.json({ review });
+    res.json({ review, remainingCredits: creditPool.remaining });
 
   } catch (err) {
     console.error('Anthropic error:', err.message);
+    refundCredit(); // generation failed — give the credit back to the pool
     res.status(500).json({ error: err.message });
   }
 });
