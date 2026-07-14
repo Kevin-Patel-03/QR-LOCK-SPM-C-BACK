@@ -22,56 +22,75 @@ if (QR_PASSWORD === 'CHANGE-ME-SET-QR_PASSWORD-IN-ENV') {
 }
 
 // -----------------------------
-// 💳 GLOBAL credit pool
+// 💳 GLOBAL credit pool (persisted externally — survives Render restarts)
 // -----------------------------
 // Credits are shared across EVERY customer / QR scan / session — it's one
 // pool for the whole app, not per-person. This is what you sell to a client
 // (e.g. "4000 review credits"), and it counts down no matter who is using it
 // or how many different phones/QR scans are involved.
 //
-// 👉 CREDIT_LIMIT only sets the STARTING size of the pool the very first time
-//    the server runs (when credits.json doesn't exist yet). After that, the
-//    pool total lives in credits.json and CREDIT_LIMIT is ignored — use the
-//    /api/admin/add-credits endpoint below to top it up.
-const fs = require('fs');
-const path = require('path');
+// 👉 CREDIT_LIMIT only sets the STARTING size of the pool the very first
+//    time it's ever loaded (when no value exists yet in Upstash). After
+//    that, use the /api/admin/add-credits endpoint below to top it up.
 const CREDIT_LIMIT = parseInt(process.env.CREDIT_LIMIT, 10) || 5;
-const CREDITS_FILE = path.join(__dirname, 'credits.json');
+const UPSTASH_URL = process.env.UPSTASH_REDIS_REST_URL;
+const UPSTASH_TOKEN = process.env.UPSTASH_REDIS_REST_TOKEN;
+const CREDIT_KEY = 'spm_review_app_credit_pool';
+
+if (!UPSTASH_URL || !UPSTASH_TOKEN) {
+  console.warn('⚠️  UPSTASH_REDIS_REST_URL / UPSTASH_REDIS_REST_TOKEN not set — credits will NOT survive a restart until you add them!');
+}
 
 // 👉 Set this in your .env to a long random string. Required to top up credits.
 const ADMIN_KEY = process.env.ADMIN_KEY || 'CHANGE-ME-SET-ADMIN_KEY-IN-ENV';
 
-function loadCreditPool() {
+async function loadCreditPool() {
   try {
-    const raw = fs.readFileSync(CREDITS_FILE, 'utf8');
-    const data = JSON.parse(raw);
-    if (typeof data.remaining === 'number') return data;
-  } catch (e) { /* file doesn't exist yet — fall through to default */ }
+    const res = await fetch(`${UPSTASH_URL}/get/${CREDIT_KEY}`, {
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` }
+    });
+    const data = await res.json();
+    if (data.result) {
+      const parsed = JSON.parse(data.result);
+      if (typeof parsed.remaining === 'number') return parsed;
+    }
+  } catch (e) {
+    console.error('Upstash load error:', e.message);
+  }
+  // Nothing stored yet — this is the very first run. Create the starting pool.
   const initial = { remaining: CREDIT_LIMIT, totalIssued: CREDIT_LIMIT };
-  saveCreditPool(initial);
+  await saveCreditPool(initial);
   return initial;
 }
 
-function saveCreditPool(pool) {
-  fs.writeFileSync(CREDITS_FILE, JSON.stringify(pool, null, 2));
+async function saveCreditPool(pool) {
+  try {
+    await fetch(`${UPSTASH_URL}/set/${CREDIT_KEY}`, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${UPSTASH_TOKEN}` },
+      body: JSON.stringify(pool)
+    });
+  } catch (e) {
+    console.error('Upstash save error:', e.message);
+  }
 }
 
-let creditPool = loadCreditPool();
-console.log(`💳 Credit pool loaded: ${creditPool.remaining} remaining of ${creditPool.totalIssued}`);
+let creditPool = { remaining: CREDIT_LIMIT, totalIssued: CREDIT_LIMIT }; // placeholder until loaded below
 
 // Reserve one credit up front (before the paid Anthropic call), so two
 // requests arriving at the same instant can't both slip through on the
 // last credit. If the generation later fails, the credit is refunded.
-function reserveCredit() {
+async function reserveCredit() {
+  creditPool = await loadCreditPool(); // always read the latest shared value first
   if (creditPool.remaining <= 0) return false;
   creditPool.remaining -= 1;
-  saveCreditPool(creditPool);
+  await saveCreditPool(creditPool);
   return true;
 }
 
-function refundCredit() {
+async function refundCredit() {
   creditPool.remaining += 1;
-  saveCreditPool(creditPool);
+  await saveCreditPool(creditPool);
 }
 
 // (Credits are NOT stored here anymore — see the global credit pool above.)
@@ -198,9 +217,10 @@ app.post('/api/verify-qr', (req, res) => {
   res.status(401).json({ success: false, error: 'That QR code is not valid for this shop.' });
 });
 
-app.get('/api/business', requireAuth, (req, res) => {
+app.get('/api/business', requireAuth, async (req, res) => {
   // Don't leak the raw review link/instagram URL if you'd rather keep it server-side only.
   // Currently sent as-is so the frontend can build the publish buttons.
+  creditPool = await loadCreditPool();
   res.json({
     ...DATABASE.business,
     ownerWhatsapp: WHATSAPP_NUMBER,
@@ -211,7 +231,8 @@ app.get('/api/business', requireAuth, (req, res) => {
 
 // 👉 The frontend polls this to refresh the credit badge in real time,
 // since the pool is shared across every customer using the app right now.
-app.get('/api/credits', requireAuth, (req, res) => {
+app.get('/api/credits', requireAuth, async (req, res) => {
+  creditPool = await loadCreditPool();
   res.json({ remainingCredits: creditPool.remaining, creditLimit: creditPool.totalIssued });
 });
 
@@ -221,7 +242,7 @@ app.get('/api/credits', requireAuth, (req, res) => {
 //    curl -X POST https://your-server/api/admin/add-credits \
 //      -H "Content-Type: application/json" -H "x-admin-key: YOUR_ADMIN_KEY" \
 //      -d '{"amount": 4000}'
-app.post('/api/admin/add-credits', (req, res) => {
+app.post('/api/admin/add-credits', async (req, res) => {
   if (req.headers['x-admin-key'] !== ADMIN_KEY || ADMIN_KEY === 'CHANGE-ME-SET-ADMIN_KEY-IN-ENV') {
     return res.status(401).json({ error: 'Unauthorized. Set ADMIN_KEY in your .env first.' });
   }
@@ -229,9 +250,10 @@ app.post('/api/admin/add-credits', (req, res) => {
   if (!amount || amount <= 0) {
     return res.status(400).json({ error: 'Provide a positive integer "amount" of credits to add.' });
   }
+  creditPool = await loadCreditPool();
   creditPool.remaining += amount;
   creditPool.totalIssued += amount;
-  saveCreditPool(creditPool);
+  await saveCreditPool(creditPool);
   res.json({ success: true, remainingCredits: creditPool.remaining, totalIssued: creditPool.totalIssued });
 });
 
@@ -245,8 +267,8 @@ app.post('/api/generate', requireAuth, async (req, res) => {
   // 🔒 Global credit check — this pool is shared by every customer using
   // the app, not per-person. Reserve a credit now; refund it below if the
   // generation call fails.
-  if (!reserveCredit()) {
-    return res.status(403).json({
+if (!(await reserveCredit())) {
+  return res.status(403).json({
       error: 'NO_CREDITS',
       message: 'All review credits for this app have been used up.',
       remainingCredits: 0
@@ -303,7 +325,7 @@ Write a 2-3 sentence positive review based on these selected items.`
 
   } catch (err) {
     console.error('Anthropic error:', err.message);
-    refundCredit(); // generation failed — give the credit back to the pool
+    await refundCredit(); // generation failed — give the credit back to the pool
     res.status(500).json({ error: err.message });
   }
 });
